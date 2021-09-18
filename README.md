@@ -6,7 +6,7 @@ This solution consists of a multi-account mechanism to lock an user account afte
 
 ## Architecture:
 
-![architecture-overview](IAM-lockout.png)
+![architecture-overview](IAM-Lockout.png)
 
 ## Installation Steps:
 
