@@ -1,0 +1,372 @@
+# /*
+#  * Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#  *
+#  * Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#  * software and associated documentation files (the "Software"), to deal in the Software
+#  * without restriction, including without limitation the rights to use, copy, modify,
+#  * merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#  * permit persons to whom the Software is furnished to do so.
+#  *
+#  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#  * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#  * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#  * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#  * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#  * AWS Customer Agreement - https://aws.amazon.com/agreement
+#  */
+AWSTemplateFormatVersion: 2010-09-09
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: Provide your values
+      Parameters:
+      - pUnlockIAMActionArn
+      - pResetIAMPasswdActionArn
+      - pAdminEmail
+    ParameterLabels:
+      pUnlockIAMActionArn:
+        default: Custom Action ARN for IAM Unlock Action
+      pResetIAMPasswdActionArn:
+        default: Custom Action ARN for IAM Reset Password Action
+      pAdminEmail:
+        default: Administrator's e-mail
+
+Parameters:
+  pUnlockIAMActionArn:
+    Description: The arn of the custom action in Security Hub. I.e. arn:aws:securityhub:<region>:<accountnumber>:action/custom/<id>
+    Type: String
+    Default: ''
+  pResetIAMPasswdActionArn:
+    Description: The arn of the custom action in Security Hub. I.e. arn:aws:securityhub:<region>:<accountnumber>:action/custom/<id>
+    Type: String
+    Default: ''
+  pAdminEmail:
+    Description: Administrator's e-mail
+    Type: String  
+
+Resources:
+
+
+######################################################
+# IAM Role for Lambda Functions
+######################################################
+
+  rLambdaIAMRole: #IAM Role for Lambda
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      RoleName: !Sub IAMLockout-Master-Role-${AWS::AccountId}
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sts:AssumeRole'
+                Resource: !Sub "arn:aws:iam::*:role/IAMLockout-Remote-Role-${AWS::AccountId}"
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'iam:GetUser'
+                  - 'iam:AttachUserPolicy'
+                  - 'iam:DetachUserPolicy'
+                  - 'iam:UpdateLoginProfile'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetRandomPassword'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref rTempPasswdSNS
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:DeleteItem'
+                Resource: 
+                  - 'arn:aws:dynamodb:*:*:BlockedUserTable'
+                  - 'arn:aws:dynamodb:*:*:LoginRegistryTable'
+
+
+########################################################
+# EventBridge Triggers for Custom Actions
+########################################################
+
+  rIAUnlockSecurityHubEventRule:
+      Type: "AWS::Events::Rule"
+      Properties:
+          Name: "Unlock-IAM"
+          Description: "This rule receives a manual Security Hub custom actions and triggers a Lambda function to unlock the specified IAM user"
+          EventPattern:
+            source: 
+              - "aws.securityhub"
+            detail-type: 
+              - "Security Hub Findings - Custom Action"
+            resources: 
+              - !Ref pUnlockIAMActionArn
+            
+          State: "ENABLED"
+          Targets:  
+            - 
+              Arn: !GetAtt rLambdaUnlockIAM.Arn
+              Id: "Unlock-IAM"
+              RetryPolicy: 
+                  MaximumRetryAttempts: 3
+                  MaximumEventAgeInSeconds: 120
+
+  rIAMResetSecurityHubEventRule:
+      Type: "AWS::Events::Rule"
+      Properties:
+          Name: "Reset-IAM"
+          Description: "This rule receives a manual Security Hub custom actions and triggers a Lambda function to reset the specified IAM user password"
+          EventPattern:
+            source: 
+              - "aws.securityhub"
+            detail-type: 
+              - "Security Hub Findings - Custom Action"
+            resources: 
+              - !Ref pResetIAMPasswdActionArn           
+          State: "ENABLED"
+          Targets: 
+            - 
+              Arn: !GetAtt rLambdaResetIAM.Arn
+              Id: "Reset-IAM-Password"
+              RetryPolicy: 
+                  MaximumRetryAttempts: 3
+                  MaximumEventAgeInSeconds: 120
+
+########################################################
+# Lambda Functions for Custom Actions
+########################################################
+
+  rLambdaUnlockIAM:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: IAMLockout-UnlockUser-Function
+      Description: Lambda function used to unlock user.
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          BlockPolicyArn: arn:aws:iam::aws:policy/AWSDenyAll
+          BlockUserTable: BlockedUserTable 
+          LoginRegistryTable: LoginRegistryTable
+          CentralAccount: !Ref AWS::AccountId
+      Role:
+        !GetAtt rLambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, os, logging
+          from boto3.dynamodb.conditions import Key, Attr
+
+          CentralAccount = os.environ.get('CentralAccount')
+          BlockPolicyArn=os.environ['BlockPolicyArn']
+          BlockUserTable=os.environ['BlockUserTable']
+          FailedLoginTable=os.environ['LoginRegistryTable']
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+            TargetAccount = str(event['detail']['findings'][0]['AwsAccountId'])
+            sts_client = boto3.client('sts')
+            assumed_role_object=sts_client.assume_role(
+              RoleArn="arn:aws:iam::{}:role/IAMLockout-Remote-Role-{}".format(TargetAccount, CentralAccount),
+              RoleSessionName="AssumeRoleUnlockIAMUser"
+            )
+            credentials=assumed_role_object['Credentials']
+              
+            dynamodb = boto3.resource(
+              'dynamodb',
+              aws_access_key_id=credentials['AccessKeyId'],
+              aws_secret_access_key=credentials['SecretAccessKey'],
+              aws_session_token=credentials['SessionToken'],
+              region_name="us-east-1",
+            
+            )
+            blockedtable = dynamodb.Table(BlockUserTable)
+            failedlogintable = dynamodb.Table(FailedLoginTable)
+            iamuser = str(event['detail']['findings'][0]['Resources'][0]['Details']['AwsIamUser']['UserName'])
+            accountid = str(event['detail']['findings'][0]['AwsAccountId'])
+            blockexists = blockedtable.scan(FilterExpression=Attr('UserID').eq(iamuser) & Attr('AccountID').eq(accountid))
+            if len(blockexists['Items']) == 0:
+              logger.info("User is not blocked, exiting.")
+              return
+            else:
+              iam = boto3.client(
+                'iam',
+                aws_access_key_id=credentials['AccessKeyId'],
+                aws_secret_access_key=credentials['SecretAccessKey'],
+                aws_session_token=credentials['SessionToken'],
+                region_name="us-east-1",                                        
+              )
+              iam.detach_user_policy(UserName=iamuser, PolicyArn=BlockPolicyArn)
+              logger.info("User has been unlocked.")
+              delete_block_entries(blockexists,blockedtable)
+              delete_login_entries(failedlogintable,iamuser,accountid)
+
+
+          def delete_block_entries(blockexists,blockedtable):
+            for item in blockexists['Items']:
+              blockedtable.delete_item(
+                Key={
+                  'EventID': item['EventID']
+                }
+              )
+            logger.info("Entry removed from BlockedUserTable")
+            
+          def delete_login_entries(failedlogintable,iamuser,accountid):
+            failedentries = failedlogintable.scan(FilterExpression=Attr('UserID').eq(iamuser) & Attr('AccountID').eq(accountid))
+            for item in failedentries['Items']:
+              failedlogintable.delete_item(
+              Key={
+                'EventID': item['EventID']
+                }
+            )
+            logger.info("Entries removed from LoginRegistryTable")                
+      Runtime: "python3.8"
+      Timeout: 20    
+
+  rLambdaUnlockIAMInvokePermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref rLambdaUnlockIAM
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+
+  rLambdaResetIAM:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: IAMLockout-ResetPassword-Function
+      Description: Lambda function used to reset password and unlock user.
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          BlockPolicyArn: arn:aws:iam::aws:policy/AWSDenyAll
+          BlockUserTable: BlockedUserTable
+          LoginRegistryTable: LoginRegistryTable
+          TopicArn: !Ref rTempPasswdSNS
+          CentralAccount: !Ref AWS::AccountId
+      Role: !GetAtt rLambdaIAMRole.Arn        
+      Code:
+        ZipFile: |
+          import boto3, os, logging
+          from boto3.dynamodb.conditions import Key, Attr
+
+          CentralAccount = os.environ.get('CentralAccount')
+          BlockPolicyArn=os.environ['BlockPolicyArn']
+          BlockUserTable=os.environ['BlockUserTable']
+          FailedLoginTable=os.environ['LoginRegistryTable']
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+            TargetAccount = str(event['detail']['findings'][0]['AwsAccountId'])
+            sts_client = boto3.client('sts')
+            assumed_role_object=sts_client.assume_role(
+              RoleArn="arn:aws:iam::{}:role/IAMLockout-Remote-Role-{}".format(TargetAccount, CentralAccount),
+              RoleSessionName="AssumeRoleUnlockIAMUser"
+            )
+            credentials=assumed_role_object['Credentials']
+
+            dynamodb = boto3.resource(
+              'dynamodb',
+              aws_access_key_id=credentials['AccessKeyId'],
+              aws_secret_access_key=credentials['SecretAccessKey'],
+              aws_session_token=credentials['SessionToken'],
+              region_name="us-east-1",
+            )
+
+            blockedtable = dynamodb.Table(BlockUserTable)
+            failedlogintable = dynamodb.Table(FailedLoginTable)
+            iamuser = str(event['detail']['findings'][0]['Resources'][0]['Details']['AwsIamUser']['UserName'])
+            accountid = str(event['detail']['findings'][0]['AwsAccountId'])
+            blockexists = blockedtable.scan(FilterExpression=Attr('UserID').eq(iamuser) & Attr('AccountID').eq(accountid))
+            if len(blockexists['Items']) == 0:
+              logger.info("User is not blocked, exiting.")
+              return
+            else:
+              reset_user_password(iamuser,credentials)
+              delete_block_entries(blockexists,blockedtable)
+              delete_login_entries(failedlogintable,iamuser,accountid)
+
+
+          def reset_user_password(iamuser,credentials):
+            secretsmanager = boto3.client('secretsmanager')
+            iam = boto3.client(
+              'iam',
+              aws_access_key_id=credentials['AccessKeyId'],
+              aws_secret_access_key=credentials['SecretAccessKey'],
+              aws_session_token=credentials['SessionToken'],
+              region_name="us-east-1",
+            )
+
+            secret = str(secretsmanager.get_random_password()["RandomPassword"])       
+            iam.update_login_profile(UserName=iamuser, Password=secret, PasswordResetRequired=True)
+            iam.detach_user_policy(UserName=iamuser, PolicyArn=BlockPolicyArn)
+            logger.info("Password reset, user has been unlocked.")
+            publish_sns_topic(iamuser,secret)
+
+          def publish_sns_topic(iamuser,secret):
+            sns = boto3.client('sns')
+            sns.publish(
+              TopicArn=os.environ['TopicArn'],
+              Subject="User "+iamuser+" temporary password",
+              Message="The new temporary password for user "+iamuser+" is "+secret
+            )
+            logger.info("Password e-mailed to administrator.")
+
+          def delete_block_entries(blockexists,blockedtable):
+            for item in blockexists['Items']:
+              blockedtable.delete_item(
+                Key={
+                  'EventID': item['EventID']
+                }
+              )
+            logger.info("Entry removed from BlockedUserTable")
+            
+          def delete_login_entries(failedlogintable,iamuser,accountid):
+            failedentries = failedlogintable.scan(FilterExpression=Attr('UserID').eq(iamuser) & Attr('AccountID').eq(accountid))
+            for item in failedentries['Items']:
+              failedlogintable.delete_item(
+                Key={
+                  'EventID': item['EventID']
+                }
+              )
+            logger.info("Entries removed from LoginRegistryTable")
+      Runtime: "python3.8"
+      Timeout: 20    
+
+  rTempPasswdSNS: #SNS sends temporary password to Administrator
+    Type: AWS::SNS::Topic
+    Properties: 
+      Subscription:
+      - Endpoint: !Ref pAdminEmail
+        Protocol: email
+
+  rLambdaResetIAMInvokePermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref rLambdaResetIAM
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"

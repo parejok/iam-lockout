@@ -1,0 +1,512 @@
+# /*
+#  * Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#  *
+#  * Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#  * software and associated documentation files (the "Software"), to deal in the Software
+#  * without restriction, including without limitation the rights to use, copy, modify,
+#  * merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#  * permit persons to whom the Software is furnished to do so.
+#  *
+#  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#  * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#  * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#  * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#  * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#  * AWS Customer Agreement - https://aws.amazon.com/agreement
+#  */
+AWSTemplateFormatVersion: 2010-09-09
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: Provide your values
+      Parameters:
+      - pCentralAccountID
+    - Label:
+        default: IAM User Block Settings
+      Parameters:
+      - pFailedLoginThreshold
+      - pFailedLoginInterval
+      - pSuccessfulLogin
+    ParameterLabels:
+      pCentralAccountID:
+        default: Central Account ID
+      pFailedLoginThreshold:
+        default: Number of failed attempts
+      pFailedLoginInterval:
+        default: Period of time (minutes) where failed attempts occurred
+      pSuccessfulLogin:
+        default: Successful login reset
+
+Parameters:
+  pCentralAccountID:
+    Description: AccountID of Central Account (Security Hub delegated administrator)
+    Type: Number
+  pFailedLoginThreshold:
+    Description: Number of failed attempts before the IAM user is blocked
+    Type: Number 
+    Default: 3
+  pFailedLoginInterval:
+    Description: Period of time in minutes that failed login attemps will be considered for blocking IAM user
+    Type: Number
+    Default: 10
+  pSuccessfulLogin:
+    Description: Select if a successful login after the failed attempts will reset the failed attempts (a Lambda function will be triggered for every Successful login)
+    Type: String
+    AllowedValues: ["Yes","No"]
+    Default: "Yes"
+
+Conditions:
+
+  cSuccessfulLogin: !Equals [ !Ref pSuccessfulLogin, "Yes"]
+
+Resources:
+
+
+######################################################
+# EventBridge - Event triggered when user login fails
+######################################################
+
+  rFailedLoginEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Event triggered when user login fails
+      EventPattern:
+        source:
+          - aws.signin
+        detail-type:
+          - AWS Console Sign In via CloudTrail
+        detail:
+          responseElements:
+            ConsoleLogin:
+              - Failure
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt rLambdaBlockUserFunction.Arn
+          Id: FailedLoginLambda
+
+
+######################################################
+# IAM Role for Lambda Functions
+######################################################
+
+  rLambdaIAMRole: #IAM Role for Lambda
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      RoleName: !Sub IAMLockout-Lambda-Role-${AWS::AccountId}
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'iam:GetUser'
+                  - 'iam:AttachUserPolicy'
+                  - 'iam:DetachUserPolicy'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+              - Effect: Allow
+                Action:
+                  - 'securityhub:BatchImportFindings'
+                Resource: 'arn:aws:securityhub:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:DeleteItem'
+                Resource: 
+                  - !GetAtt rBlockTable.Arn
+                  - !GetAtt rRegistryTable.Arn
+
+######################################################
+# Create DynamoDB Table 
+######################################################
+
+  rBlockTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      SSESpecification:
+        SSEEnabled: True
+      TableName: "BlockedUserTable"
+      AttributeDefinitions:
+        -
+          AttributeName: "EventID"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "EventID"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5    
+
+  rRegistryTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      SSESpecification:
+        SSEEnabled: True
+      TableName: "LoginRegistryTable"
+      AttributeDefinitions:
+        -
+          AttributeName: "EventID"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "EventID"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5   
+
+########################################################
+# Lambda - Blocks user and send finding to Security Hub
+########################################################
+
+  rLambdaBlockUserFunction: #Lambda function
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, json, datetime, os, time, logging
+          from boto3.dynamodb.conditions import Key, Attr
+
+          BlockPolicyArn=os.environ['BlockPolicyArn']
+          BlockUserTable=os.environ['BlockUserTable']
+          FailedLoginTable=os.environ['LoginRegistryTable']
+          NumberofAttempts=os.environ['NumberofAttempts']
+          PeriodOfTime=os.environ['PeriodOfTime']
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+
+            dynamodb = boto3.resource('dynamodb')
+
+            eventID = str(event['id'])
+            eventAccID = str(event['account'])
+            eventName = str(event['detail-type'])
+            eventSourceIP = str(event['detail']['sourceIPAddress'])
+            eventUserType = str(event['detail']['userIdentity']['type'])
+            if eventUserType == "IAMUser":                      
+              eventUsername = str(event['detail']['userIdentity']['userName'])
+            else:
+              logger.info("Not an IAM user, exiting.")
+              return
+                        
+            blockedtable = dynamodb.Table(BlockUserTable)
+            blockexists = blockedtable.scan(FilterExpression=Attr('UserID').eq(eventUsername) & Attr('AccountID').eq(eventAccID))
+            if len(blockexists['Items']) > 0:
+              logger.info("User already blocked, exiting.")
+              return
+            
+            timestamp = datetime.datetime.now()
+            failedlogintable = dynamodb.Table(FailedLoginTable)
+            
+            failedlogintable.put_item(
+              Item={
+                'EventID': eventID,
+                'UserID': eventUsername,
+                'CreatedAt': timestamp.isoformat(),
+                'AccountID': eventAccID
+              }
+            )  
+            
+            searchtime = datetime.datetime.now() - datetime.timedelta(minutes=int(PeriodOfTime))
+            countfailures = failedlogintable.scan(FilterExpression=Attr('UserID').eq(eventUsername) & Attr('CreatedAt').gt(searchtime.isoformat()) & Attr('AccountID').eq(eventAccID))
+
+            if len(countfailures['Items']) >= int(NumberofAttempts):
+
+              block_user(eventUsername)
+              create_sh_event(eventID,eventAccID,timestamp,eventUsername)
+              add_blocked_user_table(eventID,eventAccID,eventUsername,timestamp,blockedtable)
+              logger.info("IAM user "+eventUsername+" exceeded the login attempts and has been blocked.")
+            else:
+              logger.info("Failed login threshold not met, exiting.")
+              return    
+
+          def add_blocked_user_table(eventID,eventAccID,eventUsername,timestamp,blockedtable):
+            blockedtable.put_item(
+              Item={
+                'EventID': eventID,
+                'UserID': eventUsername,
+                'BlockedAt': timestamp.isoformat(),
+                'AccountID': eventAccID
+              }
+            )
+
+          def block_user(eventUsername):
+            iam = boto3.client('iam')
+            iam.attach_user_policy (UserName=eventUsername, PolicyArn=BlockPolicyArn)
+              
+            
+          def create_sh_event(eventID,eventAccID,timestamp,eventUsername): 
+            securityhub = boto3.client('securityhub')
+            new_findings = []
+            new_findings.append({
+                "SchemaVersion": "2018-10-08",
+                "Id": eventID,
+                "ProductArn": "arn:aws:securityhub:us-east-1:"+eventAccID+":product/"+eventAccID+"/default",
+                "GeneratorId": "AwsConsoleSignIn",
+                "AwsAccountId": eventAccID,
+                "CreatedAt": str(timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")+"Z"),
+                "UpdatedAt": str(datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")+"Z"),
+                "FindingProviderFields": {
+                    "Severity": {
+                        "Label": "LOW",
+                        "Original": "40"
+                    },
+                    "Types": [
+                        "Console Login/IAM/Failed Login"
+                    ]
+                },
+                "Title": "IAM user exceeeded failed login attempts",
+                "Description": "IAM user exceeeded failed login attempts",
+                "Resources": [
+                    {
+                        "Id": "arn:aws:iam:"+eventAccID+":user/"+eventUsername,
+                        "Type": "Other",
+                        "Partition": "aws",
+                        "Region": "us-east-1",
+                        "Details": {
+                            "AwsIamUser": {
+            "UserName": eventUsername
+                            }
+                        }
+                    }
+                ],
+                "WorkflowState": "NEW",
+                "RecordState": "ACTIVE"
+            })
+            securityhub.batch_import_findings(Findings=new_findings)
+      Environment:
+        Variables:
+          BlockPolicyArn: arn:aws:iam::aws:policy/AWSDenyAll
+          BlockUserTable: !Ref rBlockTable
+          LoginRegistryTable: !Ref rRegistryTable
+          NumberofAttempts: !Ref pFailedLoginThreshold
+          PeriodOfTime: !Ref pFailedLoginInterval
+      Description: Lambda function used to block user after 3 failed login attemps.
+      FunctionName: IAMLockout-BlockUser-Function
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt rLambdaIAMRole.Arn
+      Runtime: python3.8
+      Timeout: 900
+
+  rEventBridgeLambdaPermission: #Permission for EventBridge to Invoke Lambda
+    Type: "AWS::Lambda::Permission"
+    Properties: 
+      FunctionName: !GetAtt rLambdaBlockUserFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt rFailedLoginEvent.Arn
+
+
+#########################################################
+# EventBridge - Event triggered when user login succeeds
+#########################################################
+
+  rSuccessfulLoginEvent:
+    Type: AWS::Events::Rule
+    Condition: cSuccessfulLogin
+    Properties:
+      Description: Event triggered when user login succeeds
+      EventPattern:
+        source:
+          - aws.signin
+        detail-type:
+          - AWS Console Sign In via CloudTrail
+        detail:
+          responseElements:
+            ConsoleLogin:
+              - Success
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt rLambdaSuccessfulLogin.Arn
+          Id: FailedLoginLambda
+
+
+#########################################################
+# Lambda Function - triggered when user login succeeds
+#########################################################
+
+  rLambdaSuccessfulLogin:
+    Type: "AWS::Lambda::Function"
+    Condition: cSuccessfulLogin
+    Properties:
+      FunctionName: IAM-SuccessfulLogin-Function
+      Description: Lambda function used to unlock user.
+      Handler: index.lambda_handler
+      Environment:
+        Variables:  
+          LoginRegistryTable: !Ref rRegistryTable    
+      Role:
+        !GetAtt rLambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, os, logging
+          from boto3.dynamodb.conditions import Key, Attr
+
+          FailedLoginTable=os.environ['LoginRegistryTable']
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+
+            dynamodb = boto3.resource('dynamodb')
+            failedlogintable = dynamodb.Table(FailedLoginTable)
+
+            eventAccID = str(event['account'])
+            eventUserType = str(event['detail']['userIdentity']['type'])
+            if eventUserType == "IAMUser":                      
+              eventUsername = str(event['detail']['userIdentity']['userName'])
+            else:
+              logger.info("Not an IAM user, exiting.")
+              return
+
+            delete_login_entries(failedlogintable,eventUsername,eventAccID)
+
+          def delete_login_entries(failedlogintable,eventUsername,eventAccID):
+            failedentries = failedlogintable.scan(FilterExpression=Attr('UserID').eq(eventUsername) & Attr('AccountID').eq(eventAccID))
+            for item in failedentries['Items']:
+              failedlogintable.delete_item(
+              Key={
+                'EventID': item['EventID']
+                }
+            )
+            logger.info("Entries removed from LoginRegistryTable")                
+      Runtime: "python3.8"
+      Timeout: 20    
+
+  rLambdaSuccessInvokePermissions:
+    Type: "AWS::Lambda::Permission"
+    Condition: cSuccessfulLogin
+    Properties:
+      FunctionName: !Ref rLambdaSuccessfulLogin
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+
+
+###############################################################
+# IAM Role for Central Account's Custom Action Lambda Functions
+###############################################################
+
+  rCustomActionsIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${pCentralAccountID}:role/IAMLockout-Master-Role-${pCentralAccountID}
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:GetUser'
+                  - 'iam:AttachUserPolicy'
+                  - 'iam:DetachUserPolicy'
+                  - 'iam:UpdateLoginProfile'
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:DeleteItem'
+                Resource: 
+                  - !GetAtt rBlockTable.Arn
+                  - !GetAtt rRegistryTable.Arn
+      Path: '/'
+      RoleName: !Sub IAMLockout-Remote-Role-${pCentralAccountID}
+      Tags:
+      - Key: Name
+        Value: !Sub "IAM Role for Lambda calls from ${pCentralAccountID}"
+
+########################################################
+# Login Registry Table Daily Prune
+########################################################
+
+  rPruneLambdaSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Schedule event to remove old entries from the login registry table.
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${rLambdaPrune.Arn}
+          Id: PruneLambdaSchedule
+
+  rLambdaPrune:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: IAMPrune-Registry-Function
+      Description: Lambda function used to remove old entries from the login registry table.
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          LoginRegistryTable: !Ref rRegistryTable    
+      Role:
+        !GetAtt rLambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, os, logging, datetime
+          from boto3.dynamodb.conditions import Key, Attr
+
+          FailedLoginTable=os.environ['LoginRegistryTable']
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+            dynamodb = boto3.resource('dynamodb')
+            failedlogintable = dynamodb.Table(FailedLoginTable)
+            pruneinterval = datetime.datetime.now() - datetime.timedelta(days=1)
+            expiredentries = failedlogintable.scan(FilterExpression=Attr('CreatedAt').lt(pruneinterval.isoformat()))
+
+            if len(expiredentries['Items']) == 0:
+                logger.info("No entries older than 24h found on LoginRegistryTable")
+                return
+            else:
+                for item in expiredentries['Items']:
+                  failedlogintable.delete_item(
+                    Key={
+                    'EventID': item['EventID']
+                  }
+                  )
+                logger.info("Expired entries removed from LoginRegistryTable")                                          
+      Runtime: "python3.8"
+      Timeout: 20 
+
+  rLambdaPruneInvokePermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref rLambdaPrune
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
